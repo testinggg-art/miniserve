@@ -1,36 +1,37 @@
 use actix_web::http::StatusCode;
 use chrono::{DateTime, Utc};
 use chrono_humanize::Humanize;
+use clap::{crate_name, crate_version};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use std::time::SystemTime;
-use structopt::clap::{crate_name, crate_version};
 use strum::IntoEnumIterator;
 
-use crate::archive::ArchiveMethod;
-use crate::listing::{Breadcrumb, Entry, SortingMethod, SortingOrder};
+use crate::auth::CurrentUser;
+use crate::listing::{Breadcrumb, Entry, QueryParameters, SortingMethod, SortingOrder};
+use crate::{archive::ArchiveMethod, MiniserveConfig};
 
 /// Renders the file listing
-#[allow(clippy::too_many_arguments)]
 pub fn page(
     entries: Vec<Entry>,
     is_root: bool,
-    sort_method: Option<SortingMethod>,
-    sort_order: Option<SortingOrder>,
-    show_qrcode: bool,
-    file_upload: bool,
-    upload_route: &str,
-    favicon_route: &str,
-    css_route: &str,
-    default_color_scheme: &str,
-    default_color_scheme_dark: &str,
-    encoded_dir: &str,
+    query_params: QueryParameters,
     breadcrumbs: Vec<Breadcrumb>,
-    tar_enabled: bool,
-    tar_gz_enabled: bool,
-    zip_enabled: bool,
-    hide_version_footer: bool,
+    encoded_dir: &str,
+    conf: &MiniserveConfig,
+    current_user: Option<&CurrentUser>,
 ) -> Markup {
-    let upload_action = build_upload_action(upload_route, encoded_dir, sort_method, sort_order);
+    // If query_params.raw is true, we want render a minimal directory listing
+    if query_params.raw.is_some() && query_params.raw.unwrap() {
+        return raw(entries, is_root);
+    }
+
+    let upload_route = match conf.random_route {
+        Some(ref random_route) => format!("/{}/upload", random_route),
+        None => "/upload".to_string(),
+    };
+    let (sort_method, sort_order) = (query_params.sort, query_params.order);
+
+    let upload_action = build_upload_action(&upload_route, encoded_dir, sort_method, sort_order);
 
     let title_path = breadcrumbs
         .iter()
@@ -41,11 +42,11 @@ pub fn page(
     html! {
         (DOCTYPE)
         html {
-            (page_header(&title_path, file_upload, favicon_route, css_route))
+            (page_header(&title_path, conf.file_upload, &conf.favicon_route, &conf.css_route))
 
             body#drop-container
-                .(format!("default_theme_{}", default_color_scheme))
-                .(format!("default_theme_dark_{}", default_color_scheme_dark)) {
+                .(format!("default_theme_{}", conf.default_color_scheme))
+                .(format!("default_theme_dark_{}", conf.default_color_scheme_dark)) {
 
                 (PreEscaped(r#"
                     <script>
@@ -71,14 +72,14 @@ pub fn page(
                     </script>
                     "#))
 
-                @if file_upload {
+                @if conf.file_upload {
                     div.drag-form {
                         div.drag-title {
                             h1 { "Drop your file here to upload it" }
                         }
                     }
                 }
-                (color_scheme_selector(show_qrcode))
+                (color_scheme_selector(conf.show_qrcode))
                 div.container {
                     span#top { }
                     h1.title dir="ltr" {
@@ -87,7 +88,7 @@ pub fn page(
                                 // wrapped in span so the text doesn't shift slightly when it turns into a link
                                 span { bdi { (el.name) } }
                             } @else {
-                                a href=(parametrized_link(&el.link, sort_method, sort_order)) {
+                                a href=(parametrized_link(&el.link, sort_method, sort_order, false)) {
                                     bdi { (el.name) }
                                 }
                             }
@@ -95,16 +96,16 @@ pub fn page(
                         }
                     }
                     div.toolbar {
-                        @if tar_enabled || tar_gz_enabled || zip_enabled {
+                        @if conf.tar_enabled || conf.tar_gz_enabled || conf.zip_enabled {
                             div.download {
                                 @for archive_method in ArchiveMethod::iter() {
-                                    @if archive_method.is_enabled(tar_enabled, tar_gz_enabled, zip_enabled) {
+                                    @if archive_method.is_enabled(conf.tar_enabled, conf.tar_gz_enabled, conf.zip_enabled) {
                                         (archive_button(archive_method, sort_method, sort_order))
                                     }
                                 }
                             }
                         }
-                        @if file_upload {
+                        @if conf.file_upload {
                             div.upload {
                                 form id="file_submit" action=(upload_action) method="POST" enctype="multipart/form-data" {
                                     p { "Select a file to upload or drag it anywhere into the window" }
@@ -127,22 +128,59 @@ pub fn page(
                                 tr {
                                     td colspan="3" {
                                         span.root-chevron { (chevron_left()) }
-                                        a.root href=(parametrized_link("../", sort_method, sort_order)) {
+                                        a.root href=(parametrized_link("../", sort_method, sort_order, false)) {
                                             "Parent directory"
                                         }
                                     }
                                 }
                             }
                             @for entry in entries {
-                                (entry_row(entry, sort_method, sort_order))
+                                (entry_row(entry, sort_method, sort_order, false))
                             }
                         }
                     }
                     a.back href="#top" {
                         (arrow_up())
                     }
-                    @if !hide_version_footer {
-                        (version_footer())
+                    div.footer {
+                        @if conf.show_wget_footer {
+                            (wget_footer(&title_path, current_user))
+                        }
+                        @if !conf.hide_version_footer {
+                            (version_footer())
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Renders the file listing
+pub fn raw(entries: Vec<Entry>, is_root: bool) -> Markup {
+    html! {
+        (DOCTYPE)
+        html {
+            body {
+                table {
+                    thead {
+                        th.name { "Name" }
+                        th.size { "Size" }
+                        th.date { "Last modification" }
+                    }
+                    tbody {
+                        @if !is_root {
+                            tr {
+                                td colspan="3" {
+                                    a.root href=(parametrized_link("../", None, None, true)) {
+                                        ".."
+                                    }
+                                }
+                            }
+                        }
+                        @for entry in entries {
+                            (entry_row(entry, None, None, true))
+                        }
                     }
                 }
             }
@@ -153,10 +191,34 @@ pub fn page(
 // Partial: version footer
 fn version_footer() -> Markup {
     html! {
-        p.footer {
-            (format!("{}/{}", crate_name!(), crate_version!()))
-        }
+       div.version {
+           (format!("{}/{}", crate_name!(), crate_version!()))
+       }
     }
+}
+
+fn wget_footer(title_path: &str, current_user: Option<&CurrentUser>) -> Markup {
+    let count = {
+        let count_slashes = title_path.matches('/').count();
+        if count_slashes > 0 {
+            count_slashes - 1
+        } else {
+            0
+        }
+    };
+
+    let user_params = if let Some(user) = current_user {
+        format!(" --ask-password --user {}", user.name)
+    } else {
+        "".to_string()
+    };
+
+    return html! {
+        div.downloadDirectory {
+            p { "Download folder:" }
+            div.cmd { (format!("wget -r -c -nH -np --cut-dirs={} -R \"index.html*\"{} \"http://{}/?raw=true\"", count, user_params, title_path)) }
+        }
+    };
 }
 
 /// Build the action of the upload form
@@ -180,7 +242,7 @@ fn build_upload_action(
 const THEME_PICKER_CHOICES: &[(&str, &str)] = &[
     ("Default (light/dark)", "default"),
     ("Squirrel (light)", "squirrel"),
-    ("Archlinux (dark)", "archlinux"),
+    ("Arch Linux (dark)", "archlinux"),
     ("Zenburn (dark)", "zenburn"),
     ("Monokai (dark)", "monokai"),
 ];
@@ -239,7 +301,7 @@ fn archive_button(
     } else {
         format!(
             "{}&download={}",
-            parametrized_link("", sort_method, sort_order,),
+            parametrized_link("", sort_method, sort_order, false),
             archive_method
         )
     };
@@ -267,14 +329,19 @@ fn parametrized_link(
     link: &str,
     sort_method: Option<SortingMethod>,
     sort_order: Option<SortingOrder>,
+    raw: bool,
 ) -> String {
+    if raw {
+        return format!("{}?raw=true", make_link_with_trailing_slash(link));
+    }
+
     if let Some(method) = sort_method {
         if let Some(order) = sort_order {
             let parametrized_link = format!(
                 "{}?sort={}&order={}",
                 make_link_with_trailing_slash(link),
                 method,
-                order
+                order,
             );
 
             return parametrized_link;
@@ -322,26 +389,38 @@ fn entry_row(
     entry: Entry,
     sort_method: Option<SortingMethod>,
     sort_order: Option<SortingOrder>,
+    raw: bool,
 ) -> Markup {
     html! {
         tr {
             td {
                 p {
                     @if entry.is_dir() {
-                        a.directory href=(parametrized_link(&entry.link, sort_method, sort_order)) {
-                            (entry.name) "/"
-                            @if entry.is_symlink {
+                        @if let Some(symlink_dest) = entry.symlink_info {
+                            a.symlink href=(parametrized_link(&entry.link, sort_method, sort_order, raw)) {
+                                (entry.name) "/"
                                 span.symlink-symbol { }
+                                a.directory {(symlink_dest) "/"}
+                            }
+                        }@else {
+                            a.directory href=(parametrized_link(&entry.link, sort_method, sort_order, raw)) {
+                                (entry.name) "/"
                             }
                         }
                     } @else if entry.is_file() {
-                        div.file-entry {
+                        @if let Some(symlink_dest) = entry.symlink_info {
+                            a.symlink href=(&entry.link) {
+                                (entry.name)
+                                span.symlink-symbol { }
+                                a.file {(symlink_dest)}
+                            }
+                        }@else {
                             a.file href=(&entry.link) {
                                 (entry.name)
-                                @if entry.is_symlink {
-                                    span.symlink-symbol { }
-                                }
                             }
+                        }
+
+                        @if !raw {
                             @if let Some(size) = entry.size {
                                 span.mobile-info.size {
                                     (size)
@@ -469,49 +548,48 @@ fn humanize_systemtime(time: Option<SystemTime>) -> Option<String> {
 }
 
 /// Renders an error on the webpage
-#[allow(clippy::too_many_arguments)]
 pub fn render_error(
     error_description: &str,
     error_code: StatusCode,
+    conf: &MiniserveConfig,
     return_address: &str,
-    sort_method: Option<SortingMethod>,
-    sort_order: Option<SortingOrder>,
-    has_referer: bool,
-    display_back_link: bool,
-    favicon_route: &str,
-    css_route: &str,
-    default_color_scheme: &str,
-    default_color_scheme_dark: &str,
-    hide_version_footer: bool,
 ) -> Markup {
-    let link = if has_referer {
-        return_address.to_string()
-    } else {
-        parametrized_link(return_address, sort_method, sort_order)
-    };
-
     html! {
         (DOCTYPE)
         html {
-            (page_header(&error_code.to_string(), false, favicon_route, css_route))
+            (page_header(&error_code.to_string(), false, &conf.favicon_route, &conf.css_route))
 
-            body.(format!("default_theme_{}", default_color_scheme))
-                .(format!("default_theme_dark_{}", default_color_scheme_dark)) {
+            body.(format!("default_theme_{}", conf.default_color_scheme))
+                .(format!("default_theme_dark_{}", conf.default_color_scheme_dark)) {
+
+                (PreEscaped(r#"
+                    <script>
+                        // read theme from local storage and apply it to body
+                        var theme = localStorage.getItem('theme');
+                        if (theme != null && theme != 'default') {
+                            document.body.classList.add('theme_' + theme);
+                        }
+                    </script>
+                    "#))
 
                 div.error {
                     p { (error_code.to_string()) }
                     @for error in error_description.lines() {
                         p { (error) }
                     }
-                    @if display_back_link {
+                    // WARN don't expose random route!
+                    @if !conf.random_route.is_some() {
                         div.error-nav {
-                            a.error-back href=(link) {
+                            a.error-back href=(return_address) {
                                 "Go back to file listing"
                             }
                         }
                     }
-                    @if !hide_version_footer {
-                        (version_footer())
+                    @if !conf.hide_version_footer {
+                        p.footer {
+                            (version_footer())
+                        }
+
                     }
                 }
             }

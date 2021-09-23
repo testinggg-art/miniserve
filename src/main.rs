@@ -1,19 +1,18 @@
 use std::io;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::thread;
 use std::time::Duration;
 
 use actix_web::web;
-use actix_web::{
-    http::{header::ContentType, StatusCode},
-    Responder,
-};
+use actix_web::{http::header::ContentType, Responder};
 use actix_web::{middleware, App, HttpRequest, HttpResponse};
-use anyhow::Result;
+use anyhow::{bail, Result};
+use clap::{crate_version, Clap, IntoApp};
+use clap_generate::generators::{Bash, Elvish, Fish, PowerShell, Zsh};
+use clap_generate::{generate, Shell};
 use log::{error, warn};
-use structopt::clap::crate_version;
-use structopt::StructOpt;
+use qrcodegen::{QrCode, QrCodeEcc};
 use yansi::{Color, Paint};
 
 mod archive;
@@ -30,19 +29,32 @@ use crate::config::MiniserveConfig;
 use crate::errors::ContextualError;
 
 fn main() -> Result<()> {
-    let args = args::CliArgs::from_args();
+    let args = args::CliArgs::parse();
 
     if let Some(shell) = args.print_completions {
-        args::CliArgs::clap().gen_completions_to("miniserve", shell, &mut std::io::stdout());
+        let mut clap_app = args::CliArgs::into_app();
+        match shell {
+            Shell::Bash => generate::<Bash, _>(&mut clap_app, "miniserve", &mut std::io::stdout()),
+            Shell::Elvish => {
+                generate::<Elvish, _>(&mut clap_app, "miniserve", &mut std::io::stdout())
+            }
+            Shell::Fish => generate::<Fish, _>(&mut clap_app, "miniserve", &mut std::io::stdout()),
+            Shell::PowerShell => {
+                generate::<PowerShell, _>(&mut clap_app, "miniserve", &mut std::io::stdout())
+            }
+            Shell::Zsh => generate::<Zsh, _>(&mut clap_app, "miniserve", &mut std::io::stdout()),
+            _ => bail!("Invalid shell provided!"),
+        }
         return Ok(());
     }
 
     let miniserve_config = MiniserveConfig::try_from_args(args)?;
 
-    match run(miniserve_config) {
-        Ok(()) => (),
-        Err(e) => errors::log_error_chain(e.to_string()),
-    }
+    run(miniserve_config).map_err(|e| {
+        errors::log_error_chain(e.to_string());
+        e
+    })?;
+
     Ok(())
 }
 
@@ -89,23 +101,6 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), ContextualError> {
 
     let inside_config = miniserve_config.clone();
 
-    let interfaces = miniserve_config
-        .interfaces
-        .iter()
-        .map(|&interface| {
-            if interface == IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) {
-                // If the interface is 0.0.0.0, we'll change it to 127.0.0.1 so that clicking the link will
-                // also work on Windows. Why can't Windows interpret 0.0.0.0?
-                "127.0.0.1".to_string()
-            } else if interface.is_ipv6() {
-                // If the interface is IPv6 then we'll print it with brackets so that it is clickable.
-                format!("[{}]", interface)
-            } else {
-                format!("{}", interface)
-            }
-        })
-        .collect::<Vec<String>>();
-
     let canon_path = miniserve_config.path.canonicalize().map_err(|e| {
         ContextualError::IoError("Failed to resolve path to be served".to_string(), e)
     })?;
@@ -151,269 +146,198 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), ContextualError> {
             thread::sleep(Duration::from_millis(500));
         }
     }
-    let mut addresses = String::new();
-    for interface in &interfaces {
-        if !addresses.is_empty() {
-            addresses.push_str(", ");
-        }
-        let protocol = if miniserve_config.tls_rustls_config.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        addresses.push_str(&format!(
-            "{}",
-            Color::Green
-                .paint(format!(
-                    "{protocol}://{interface}:{port}",
-                    protocol = protocol,
-                    interface = &interface,
-                    port = miniserve_config.port
-                ))
-                .bold()
-        ));
 
-        if let Some(random_route) = miniserve_config.clone().random_route {
-            addresses.push_str(&format!(
-                "{}",
-                Color::Green
-                    .paint(format!("/{random_route}", random_route = random_route,))
-                    .bold()
-            ));
-        }
-    }
+    let display_urls = {
+        let (mut ifaces, wildcard): (Vec<_>, Vec<_>) = miniserve_config
+            .interfaces
+            .clone()
+            .into_iter()
+            .partition(|addr| !addr.is_unspecified());
 
-    let socket_addresses = interfaces
-        .iter()
-        .map(|interface| {
-            format!(
-                "{interface}:{port}",
-                interface = &interface,
-                port = miniserve_config.port,
-            )
-            .parse::<SocketAddr>()
-        })
-        .collect::<Result<Vec<SocketAddr>, _>>();
-
-    let socket_addresses = match socket_addresses {
-        Ok(addresses) => addresses,
-        Err(e) => {
-            // Note that this should never fail, since CLI parsing succeeded
-            // This means the format of each IP address is valid, and so is the port
-            // Valid IpAddr + valid port == valid SocketAddr
-            return Err(ContextualError::ParseError(
-                "string as socket address".to_string(),
-                e.to_string(),
-            ));
+        // Replace wildcard addresses with local interface addresses
+        if !wildcard.is_empty() {
+            let all_ipv4 = wildcard.iter().any(|addr| addr.is_ipv4());
+            let all_ipv6 = wildcard.iter().any(|addr| addr.is_ipv6());
+            ifaces = get_if_addrs::get_if_addrs()
+                .unwrap_or_else(|e| {
+                    error!("Failed to get local interface addresses: {}", e);
+                    Default::default()
+                })
+                .into_iter()
+                .map(|iface| iface.ip())
+                .filter(|ip| (all_ipv4 && ip.is_ipv4()) || (all_ipv6 && ip.is_ipv6()))
+                .collect();
+            ifaces.sort();
         }
+
+        ifaces
+            .into_iter()
+            .map(|addr| match addr {
+                IpAddr::V4(_) => format!("{}:{}", addr, miniserve_config.port),
+                IpAddr::V6(_) => format!("[{}]:{}", addr, miniserve_config.port),
+            })
+            .map(|addr| match miniserve_config.tls_rustls_config {
+                Some(_) => format!("https://{}", addr),
+                None => format!("http://{}", addr),
+            })
+            .map(|url| match miniserve_config.random_route {
+                Some(ref random_route) => format!("{}/{}", url, random_route),
+                None => url,
+            })
+            .collect::<Vec<_>>()
     };
+
+    let socket_addresses = miniserve_config
+        .interfaces
+        .iter()
+        .map(|&interface| SocketAddr::new(interface, miniserve_config.port))
+        .collect::<Vec<_>>();
+
+    let display_sockets = socket_addresses
+        .iter()
+        .map(|sock| Color::Green.paint(sock.to_string()).bold().to_string())
+        .collect::<Vec<_>>();
 
     let srv = actix_web::HttpServer::new(move || {
         App::new()
             .wrap(configure_header(&inside_config.clone()))
             .app_data(inside_config.clone())
-            // we should use `actix_web_httpauth::middleware::HttpAuthentication`
-            // but it is unfortuantrly broken
-            // see: https://github.com/actix/actix-extras/issues/127
-            // TODO replace this when fixed upstream
-            .wrap_fn(auth::auth_middleware)
+            .wrap_fn(errors::error_page_middleware)
             .wrap(middleware::Logger::default())
             .route(
                 &format!("/{}", inside_config.favicon_route),
                 web::get().to(favicon),
             )
             .route(&format!("/{}", inside_config.css_route), web::get().to(css))
-            .configure(|c| configure_app(c, &inside_config))
+            .service(
+                web::scope(inside_config.random_route.as_deref().unwrap_or(""))
+                    // we should use `actix_web_httpauth::middleware::HttpAuthentication`
+                    // but it is unfortuantrly broken
+                    // see: https://github.com/actix/actix-extras/issues/127
+                    // TODO replace this when fixed upstream
+                    .wrap_fn(auth::auth_middleware)
+                    .configure(|c| configure_app(c, &inside_config)),
+            )
             .default_service(web::get().to(error_404))
     });
 
-    #[cfg(feature = "tls")]
-    let srv = if let Some(tls_config) = miniserve_config.tls_rustls_config {
-        srv.bind_rustls(socket_addresses.as_slice(), tls_config)
-            .map_err(|e| ContextualError::IoError("Failed to bind server".to_string(), e))?
-            .shutdown_timeout(0)
-            .run()
-    } else {
-        srv.bind(socket_addresses.as_slice())
-            .map_err(|e| ContextualError::IoError("Failed to bind server".to_string(), e))?
-            .shutdown_timeout(0)
-            .run()
-    };
+    let srv = socket_addresses.iter().try_fold(srv, |srv, addr| {
+        let listener = create_tcp_listener(*addr).map_err(|e| {
+            ContextualError::IoError(format!("Failed to bind server to {}", addr), e)
+        })?;
 
-    #[cfg(not(feature = "tls"))]
-    let srv = srv
-        .bind(socket_addresses.as_slice())
-        .map_err(|e| ContextualError::IoError("Failed to bind server".to_string(), e))?
-        .shutdown_timeout(0)
-        .run();
+        #[cfg(feature = "tls")]
+        let srv = match &miniserve_config.tls_rustls_config {
+            Some(tls_config) => srv.listen_rustls(listener, tls_config.clone()),
+            None => srv.listen(listener),
+        };
+
+        #[cfg(not(feature = "tls"))]
+        let srv = srv.listen(listener);
+
+        srv.map_err(|e| ContextualError::IoError(format!("Failed to bind server to {}", addr), e))
+    })?;
+
+    let srv = srv.shutdown_timeout(0).run();
+
+    println!("Bound to {}", display_sockets.join(", "));
+
+    println!("Serving path {}", Color::Yellow.paint(path_string).bold());
 
     println!(
-        "Serving path {path} at {addresses}",
-        path = Color::Yellow.paint(path_string).bold(),
-        addresses = addresses,
+        "Availabe at (non-exhaustive list):\n    {}\n",
+        display_urls
+            .iter()
+            .map(|url| Color::Green.paint(url).bold().to_string())
+            .collect::<Vec<_>>()
+            .join("\n    "),
     );
 
+    // print QR code to terminal
+    if miniserve_config.show_qrcode && atty::is(atty::Stream::Stdout) {
+        for url in display_urls
+            .iter()
+            .filter(|url| !url.contains("//127.0.0.1:") && !url.contains("//[::1]:"))
+        {
+            match QrCode::encode_text(url, QrCodeEcc::Low) {
+                Ok(qr) => {
+                    println!("QR code for {}:", Color::Green.paint(url).bold());
+                    print_qr(&qr);
+                }
+                Err(e) => {
+                    error!("Failed to render QR to terminal: {}", e);
+                }
+            };
+        }
+    }
+
     if atty::is(atty::Stream::Stdout) {
-        println!("\nQuit by pressing CTRL-C");
+        println!("Quit by pressing CTRL-C");
     }
 
     srv.await
         .map_err(|e| ContextualError::IoError("".to_owned(), e))
 }
 
-fn configure_header(conf: &MiniserveConfig) -> middleware::DefaultHeaders {
-    let headers = conf.clone().header;
-
-    let mut default_headers = middleware::DefaultHeaders::new();
-    for header in headers {
-        for (header_name, header_value) in header.into_iter() {
-            if let Some(header_name) = header_name {
-                default_headers = default_headers.header(&header_name, header_value);
-            }
-        }
+/// Allows us to set low-level socket options
+///
+/// This mainly used to set `set_only_v6` socket option
+/// to get a consistent behavior across platforms.
+/// see: https://github.com/svenstaro/miniserve/pull/500
+fn create_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
     }
-    default_headers
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024 /* Default backlog */)?;
+    Ok(TcpListener::from(socket))
+}
+
+fn configure_header(conf: &MiniserveConfig) -> middleware::DefaultHeaders {
+    conf.header.iter().flatten().fold(
+        middleware::DefaultHeaders::new(),
+        |headers, (header_name, header_value)| headers.header(header_name, header_value),
+    )
 }
 
 /// Configures the Actix application
 fn configure_app(app: &mut web::ServiceConfig, conf: &MiniserveConfig) {
-    let random_route = conf.random_route.clone().unwrap_or_default();
-    let uses_random_route = conf.random_route.clone().is_some();
-    let full_route = format!("/{}", random_route);
-
-    let upload_route = if let Some(random_route) = conf.random_route.clone() {
-        format!("/{}/upload", random_route)
-    } else {
-        "/upload".to_string()
+    let files_service = || {
+        let files = actix_files::Files::new("", &conf.path);
+        let files = match &conf.index {
+            Some(index_file) => files.index_file(index_file.to_string_lossy()),
+            None => files,
+        };
+        let files = match conf.show_hidden {
+            true => files.use_hidden_files(),
+            false => files,
+        };
+        files
+            .show_files_listing()
+            .files_listing_renderer(listing::directory_listing)
+            .prefer_utf8(true)
+            .redirect_to_slash_directory()
+            .default_handler(web::to(error_404))
     };
 
-    let serve_path = {
-        let path = &conf.path;
-        let no_symlinks = conf.no_symlinks;
-        let show_hidden = conf.show_hidden;
-        let random_route = conf.random_route.clone();
-        let favicon_route = conf.favicon_route.clone();
-        let css_route = conf.css_route.clone();
-        let default_color_scheme = conf.default_color_scheme.clone();
-        let default_color_scheme_dark = conf.default_color_scheme_dark.clone();
-        let show_qrcode = conf.show_qrcode;
-        let file_upload = conf.file_upload;
-        let tar_enabled = conf.tar_enabled;
-        let tar_gz_enabled = conf.tar_gz_enabled;
-        let zip_enabled = conf.zip_enabled;
-        let dirs_first = conf.dirs_first;
-        let hide_version_footer = conf.hide_version_footer;
-        let title = conf.title.clone();
-
-        if path.is_file() {
-            None
-        } else {
-            let u_r = upload_route.clone();
-
-            // build `Files` service using configuraion parameters
-            let files = actix_files::Files::new(&full_route, path);
-            let files = match &conf.index {
-                Some(index_file) => files.index_file(index_file.to_string_lossy()),
-                None => files,
-            };
-            let files = match show_hidden {
-                true => files.use_hidden_files(),
-                false => files,
-            };
-            let files = files
-                .show_files_listing()
-                .files_listing_renderer(move |dir, req| {
-                    listing::directory_listing(
-                        dir,
-                        req,
-                        no_symlinks,
-                        show_hidden,
-                        file_upload,
-                        random_route.clone(),
-                        favicon_route.clone(),
-                        css_route.clone(),
-                        &default_color_scheme,
-                        &default_color_scheme_dark,
-                        show_qrcode,
-                        u_r.clone(),
-                        tar_enabled,
-                        tar_gz_enabled,
-                        zip_enabled,
-                        dirs_first,
-                        hide_version_footer,
-                        title.clone(),
-                    )
-                })
-                .prefer_utf8(true)
-                .redirect_to_slash_directory()
-                .default_handler(web::to(error_404));
-            Some(files)
-        }
-    };
-
-    let favicon_route = conf.favicon_route.clone();
-    let css_route = conf.css_route.clone();
-
-    let default_color_scheme = conf.default_color_scheme.clone();
-    let default_color_scheme_dark = conf.default_color_scheme_dark.clone();
-    let hide_version_footer = conf.hide_version_footer;
-
-    if let Some(serve_path) = serve_path {
+    if !conf.path.is_file() {
         if conf.file_upload {
             // Allow file upload
-            app.service(
-                web::resource(&upload_route).route(web::post().to(move |req, payload| {
-                    file_upload::upload_file(
-                        req,
-                        payload,
-                        uses_random_route,
-                        favicon_route.clone(),
-                        css_route.clone(),
-                        default_color_scheme.clone(),
-                        default_color_scheme_dark.clone(),
-                        hide_version_footer,
-                    )
-                })),
-            )
-            // Handle directories
-            .service(serve_path);
-        } else {
-            // Handle directories
-            app.service(serve_path);
+            app.service(web::resource("/upload").route(web::post().to(file_upload::upload_file)));
         }
+        // Handle directories
+        app.service(files_service());
     } else {
         // Handle single files
-        app.service(web::resource(&full_route).route(web::to(listing::file_handler)));
+        app.service(web::resource(["", "/"]).route(web::to(listing::file_handler)));
     }
 }
 
-async fn error_404(req: HttpRequest) -> HttpResponse {
-    let err_404 = ContextualError::RouteNotFoundError(req.path().to_string());
-    let conf = req.app_data::<MiniserveConfig>().unwrap();
-    let uses_random_route = conf.random_route.is_some();
-    let favicon_route = conf.favicon_route.clone();
-    let css_route = conf.css_route.clone();
-    let query_params = listing::extract_query_parameters(&req);
-
-    errors::log_error_chain(err_404.to_string());
-
-    actix_web::HttpResponse::NotFound().body(
-        renderer::render_error(
-            &err_404.to_string(),
-            StatusCode::NOT_FOUND,
-            "/",
-            query_params.sort,
-            query_params.order,
-            false,
-            !uses_random_route,
-            &favicon_route,
-            &css_route,
-            &conf.default_color_scheme,
-            &conf.default_color_scheme_dark,
-            conf.hide_version_footer,
-        )
-        .into_string(),
-    )
+async fn error_404(req: HttpRequest) -> Result<HttpResponse, ContextualError> {
+    Err(ContextualError::RouteNotFoundError(req.path().to_string()))
 }
 
 async fn favicon() -> impl Responder {
@@ -428,4 +352,32 @@ async fn css() -> impl Responder {
     HttpResponse::Ok()
         .insert_header(ContentType(mime::TEXT_CSS))
         .message_body(css.into())
+}
+
+// Prints to the console two inverted QrCodes side by side.
+fn print_qr(qr: &QrCode) {
+    let border = 4;
+    let size = qr.size() + 2 * border;
+
+    for y in (0..size).step_by(2) {
+        for x in 0..2 * size {
+            let inverted = x >= size;
+            let (x, y) = (x % size - border, y - border);
+
+            //each char represents two vertical modules
+            let (mod1, mod2) = match inverted {
+                false => (qr.get_module(x, y), qr.get_module(x, y + 1)),
+                true => (!qr.get_module(x, y), !qr.get_module(x, y + 1)),
+            };
+            let c = match (mod1, mod2) {
+                (false, false) => ' ',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (true, true) => '█',
+            };
+            print!("{0}", c);
+        }
+        println!();
+    }
+    println!();
 }

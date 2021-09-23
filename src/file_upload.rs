@@ -1,18 +1,17 @@
-use actix_web::{
-    http::{header, StatusCode},
-    HttpRequest, HttpResponse,
-};
+use actix_web::{http::header, HttpRequest, HttpResponse};
 use futures::TryStreamExt;
 use std::{
     io::Write,
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
-use crate::errors::{self, ContextualError};
-use crate::listing::{self, SortingMethod, SortingOrder};
-use crate::renderer;
+use crate::errors::ContextualError;
+use crate::listing::{self};
 
-/// Create future to save file.
+/// Saves file data from a multipart form field (`field`) to `file_path`, optionally overwriting
+/// existing file.
+///
+/// Returns total bytes written to file.
 async fn save_file(
     field: actix_multipart::Field,
     file_path: PathBuf,
@@ -38,10 +37,10 @@ async fn save_file(
     Ok(written_len)
 }
 
-/// Create new future to handle file as multipart data.
+/// Handles a single field in a multipart form
 async fn handle_multipart(
     field: actix_multipart::Field,
-    file_path: PathBuf,
+    path: PathBuf,
     overwrite_files: bool,
 ) -> Result<u64, ContextualError> {
     let filename = field
@@ -54,21 +53,25 @@ async fn handle_multipart(
             )
         })?;
 
-    match std::fs::metadata(&file_path) {
+    let filename = sanitize_path(Path::new(&filename), false).ok_or_else(|| {
+        ContextualError::InvalidPathError("Invalid file name to upload".to_string())
+    })?;
+
+    match std::fs::metadata(&path) {
         Err(_) => Err(ContextualError::InsufficientPermissionsError(
-            file_path.display().to_string(),
+            path.display().to_string(),
         )),
         Ok(metadata) if !metadata.is_dir() => Err(ContextualError::InvalidPathError(format!(
             "cannot upload file to {}, since it's not a directory",
-            &file_path.display()
+            &path.display()
         ))),
         Ok(metadata) if metadata.permissions().readonly() => Err(
-            ContextualError::InsufficientPermissionsError(file_path.display().to_string()),
+            ContextualError::InsufficientPermissionsError(path.display().to_string()),
         ),
         Ok(_) => Ok(()),
     }?;
 
-    save_file(field, file_path.join(filename), overwrite_files).await
+    save_file(field, path.join(filename), overwrite_files).await
 }
 
 /// Handle incoming request to upload file.
@@ -76,17 +79,10 @@ async fn handle_multipart(
 /// server root directory. Any path which will go outside of this directory is considered
 /// invalid.
 /// This method returns future.
-#[allow(clippy::too_many_arguments)]
 pub async fn upload_file(
     req: HttpRequest,
     payload: actix_web::web::Payload,
-    uses_random_route: bool,
-    favicon_route: String,
-    css_route: String,
-    default_color_scheme: String,
-    default_color_scheme_dark: String,
-    hide_version_footer: bool,
-) -> Result<HttpResponse, actix_web::Error> {
+) -> Result<HttpResponse, ContextualError> {
     let conf = req.app_data::<crate::MiniserveConfig>().unwrap();
     let return_path = if let Some(header) = req.headers().get(header::REFERER) {
         header.to_str().unwrap_or("/").to_owned()
@@ -95,138 +91,94 @@ pub async fn upload_file(
     };
 
     let query_params = listing::extract_query_parameters(&req);
-    let upload_path = match query_params.path.clone() {
-        Some(path) => match path.strip_prefix(Component::RootDir) {
-            Ok(stripped_path) => stripped_path.to_owned(),
-            Err(_) => path.clone(),
-        },
-        None => {
-            let err = ContextualError::InvalidHttpRequestError(
-                "Missing query parameter 'path'".to_string(),
-            );
-            return Ok(create_error_response(
-                &err.to_string(),
-                StatusCode::BAD_REQUEST,
-                &return_path,
-                query_params.sort,
-                query_params.order,
-                uses_random_route,
-                &favicon_route,
-                &css_route,
-                &default_color_scheme,
-                &default_color_scheme_dark,
-                hide_version_footer,
-            ));
-        }
-    };
+    let upload_path = query_params.path.as_ref().ok_or_else(|| {
+        ContextualError::InvalidHttpRequestError("Missing query parameter 'path'".to_string())
+    })?;
+    let upload_path = sanitize_path(upload_path, conf.show_hidden).ok_or_else(|| {
+        ContextualError::InvalidPathError("Invalid value for 'path' parameter".to_string())
+    })?;
 
-    let app_root_dir = match conf.path.canonicalize() {
-        Ok(dir) => dir,
-        Err(e) => {
-            let err = ContextualError::IoError(
-                "Failed to resolve path served by miniserve".to_string(),
-                e,
-            );
-            return Ok(create_error_response(
-                &err.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &return_path,
-                query_params.sort,
-                query_params.order,
-                uses_random_route,
-                &favicon_route,
-                &css_route,
-                &default_color_scheme,
-                &default_color_scheme_dark,
-                hide_version_footer,
-            ));
-        }
-    };
+    let app_root_dir = conf.path.canonicalize().map_err(|e| {
+        ContextualError::IoError("Failed to resolve path served by miniserve".to_string(), e)
+    })?;
 
     // If the target path is under the app root directory, save the file.
-    let target_dir = match &app_root_dir.join(upload_path).canonicalize() {
-        Ok(path) if path.starts_with(&app_root_dir) => path.clone(),
-        _ => {
-            let err = ContextualError::InvalidHttpRequestError(
-                "Invalid value for 'path' parameter".to_string(),
-            );
-            return Ok(create_error_response(
-                &err.to_string(),
-                StatusCode::BAD_REQUEST,
-                &return_path,
-                query_params.sort,
-                query_params.order,
-                uses_random_route,
-                &favicon_route,
-                &css_route,
-                &default_color_scheme,
-                &default_color_scheme_dark,
-                hide_version_footer,
-            ));
-        }
-    };
-    let overwrite_files = conf.overwrite_files;
-    let default_color_scheme = conf.default_color_scheme.clone();
-    let default_color_scheme_dark = conf.default_color_scheme_dark.clone();
-
-    match actix_multipart::Multipart::new(req.headers(), payload)
-        .map_err(ContextualError::MultipartError)
-        .and_then(move |field| handle_multipart(field, target_dir.clone(), overwrite_files))
-        .try_collect::<Vec<u64>>()
-        .await
-    {
-        Ok(_) => Ok(HttpResponse::SeeOther()
-            .append_header((header::LOCATION, return_path))
-            .finish()),
-        Err(e) => Ok(create_error_response(
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &return_path,
-            query_params.sort,
-            query_params.order,
-            uses_random_route,
-            &favicon_route,
-            &css_route,
-            &default_color_scheme,
-            &default_color_scheme_dark,
-            hide_version_footer,
+    let target_dir = match app_root_dir.join(upload_path).canonicalize() {
+        Ok(path) if !conf.no_symlinks => Ok(path),
+        Ok(path) if path.starts_with(&app_root_dir) => Ok(path),
+        _ => Err(ContextualError::InvalidHttpRequestError(
+            "Invalid value for 'path' parameter".to_string(),
         )),
-    }
+    }?;
+
+    actix_multipart::Multipart::new(req.headers(), payload)
+        .map_err(ContextualError::MultipartError)
+        .and_then(|field| handle_multipart(field, target_dir.clone(), conf.overwrite_files))
+        .try_collect::<Vec<u64>>()
+        .await?;
+
+    Ok(HttpResponse::SeeOther()
+        .append_header((header::LOCATION, return_path))
+        .finish())
 }
 
-/// Convenience method for creating response errors, if file upload fails.
-#[allow(clippy::too_many_arguments)]
-fn create_error_response(
-    description: &str,
-    error_code: StatusCode,
-    return_path: &str,
-    sorting_method: Option<SortingMethod>,
-    sorting_order: Option<SortingOrder>,
-    uses_random_route: bool,
-    favicon_route: &str,
-    css_route: &str,
-    default_color_scheme: &str,
-    default_color_scheme_dark: &str,
-    hide_version_footer: bool,
-) -> HttpResponse {
-    errors::log_error_chain(description.to_string());
-    HttpResponse::BadRequest()
-        .content_type("text/html; charset=utf-8")
-        .body(
-            renderer::render_error(
-                description,
-                error_code,
-                return_path,
-                sorting_method,
-                sorting_order,
-                true,
-                !uses_random_route,
-                favicon_route,
-                css_route,
-                default_color_scheme,
-                default_color_scheme_dark,
-                hide_version_footer,
-            )
-            .into_string(),
-        )
+/// Guarantee that the path is relative and cannot traverse back to parent directories
+/// and optionally prevent traversing hidden directories.
+///
+/// See the unit tests tests::test_sanitize_path* for examples
+fn sanitize_path(path: &Path, traverse_hidden: bool) -> Option<PathBuf> {
+    let mut buf = PathBuf::new();
+
+    for comp in path.components() {
+        match comp {
+            Component::Normal(name) => buf.push(name),
+            Component::ParentDir => {
+                buf.pop();
+            }
+            _ => (),
+        }
+    }
+
+    // Double-check that all components are Normal and check for hidden dirs
+    for comp in buf.components() {
+        match comp {
+            Component::Normal(_) if traverse_hidden => (),
+            Component::Normal(name) if !name.to_str()?.starts_with('.') => (),
+            _ => return None,
+        }
+    }
+
+    Some(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("/foo", "foo")]
+    #[case("////foo", "foo")]
+    #[case("C:/foo", if cfg!(windows) { "foo" } else { "C:/foo" })]
+    #[case("../foo", "foo")]
+    #[case("../foo/../bar/abc", "bar/abc")]
+    fn test_sanitize_path(#[case] input: &str, #[case] output: &str) {
+        assert_eq!(
+            sanitize_path(Path::new(input), true).unwrap(),
+            Path::new(output)
+        );
+        assert_eq!(
+            sanitize_path(Path::new(input), false).unwrap(),
+            Path::new(output)
+        );
+    }
+
+    #[rstest]
+    #[case(".foo")]
+    #[case("/.foo")]
+    #[case("foo/.bar/foo")]
+    fn test_sanitize_path_no_hidden_files(#[case] input: &str) {
+        assert_eq!(sanitize_path(Path::new(input), false), None);
+    }
 }

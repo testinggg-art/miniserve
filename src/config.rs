@@ -1,11 +1,13 @@
+#[cfg(feature = "tls")]
+use std::{fs::File, io::BufReader};
 use std::{
-    fs::File,
-    io::BufReader,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
 };
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "tls")]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 use http::HeaderMap;
 
 #[cfg(feature = "tls")]
@@ -93,8 +95,14 @@ pub struct MiniserveConfig {
     /// If specified, header will be added
     pub header: Vec<HeaderMap>,
 
+    /// If specified, symlink destination will be shown
+    pub show_symlink_info: bool,
+
     /// If enabled, version footer is hidden
     pub hide_version_footer: bool,
+
+    /// If enabled, display a wget command to recursively download the current directory
+    pub show_wget_footer: bool,
 
     /// If set, use provided rustls config for TLS
     #[cfg(feature = "tls")]
@@ -185,7 +193,9 @@ impl MiniserveConfig {
             dirs_first: args.dirs_first,
             title: args.title,
             header: args.header,
+            show_symlink_info: args.show_symlink_info,
             hide_version_footer: args.hide_version_footer,
+            show_wget_footer: args.show_wget_footer,
             tls_rustls_config: tls_rustls_server_config,
         })
     }

@@ -8,10 +8,25 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 <!-- next-header -->
 
 ## [Unreleased] - ReleaseDate
+- Add raw mode and raw mode footer display [#508](https://github.com/svenstaro/miniserve/pull/508) (thanks @Jikstra)
+
+## [0.17.0] - 2021-09-04
+- Print QR codes on terminal [#524](https://github.com/svenstaro/miniserve/pull/524) (thanks @aliemjay)
+- Fix mobile layout info pills taking whole width [#591](https://github.com/svenstaro/miniserve/issues/591)
+- Fix security exploit when uploading is enabled [#590](https://github.com/svenstaro/miniserve/pull/590) [#518](https://github.com/svenstaro/miniserve/issues/518) (thanks @aliemjay)
+- Fix uploading to symlink directories [#590](https://github.com/svenstaro/miniserve/pull/590) [#466](https://github.com/svenstaro/miniserve/issues/466) (thanks @aliemjay)
+
+## [0.16.0] - 2021-08-31
 - Fix serving files with backslashes in their names [#578](https://github.com/svenstaro/miniserve/pull/578) (thanks @Jikstra)
 - Fix behavior of downloading symlinks by upgrading to actix-web 4 [#582](https://github.com/svenstaro/miniserve/pull/582) [#462](https://github.com/svenstaro/miniserve/issues/462) (thanks @aliemjay)
 - List directory if index file not found [#583](https://github.com/svenstaro/miniserve/pull/583) [#275](https://github.com/svenstaro/miniserve/pull/583) (thanks @aliemjay)
 - Add special colors for visited links [#521](https://github.com/svenstaro/miniserve/pull/521) (thanks @raffomania)
+- Switch from structopt to clap v3 [#587](https://github.com/svenstaro/miniserve/pull/587)
+
+  This enables slightly nicer help output as well as much better completions.
+- Fix network interface handling [#500](https://github.com/svenstaro/miniserve/pull/500) [#470](https://github.com/svenstaro/miniserve/issues/470) [#405](https://github.com/svenstaro/miniserve/issues/405) [#422](https://github.com/svenstaro/miniserve/issues/422) (thanks @aliemjay)
+- Implement show symlink destination [#542](https://github.com/svenstaro/miniserve/pull/542) [#499](https://github.com/svenstaro/miniserve/issues/499) (thanks @deantvv)
+- Fix error page not being correctly themed [#529](https://github.com/svenstaro/miniserve/pull/529) [#588](https://github.com/svenstaro/miniserve/issues/588) (@aliemjay)
 
 ## [0.15.0] - 2021-08-27
 - Add hardened systemd template unit file to `packaging/miniserve@.service`
@@ -103,7 +118,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - Some theme related bug fixes (thanks @boastful-squirrel)
 
 <!-- next-url -->
-[Unreleased]: https://github.com/svenstaro/miniserve/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/svenstaro/miniserve/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/svenstaro/miniserve/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/svenstaro/miniserve/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/svenstaro/miniserve/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/svenstaro/miniserve/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/svenstaro/miniserve/compare/v0.12.1...v0.13.0
